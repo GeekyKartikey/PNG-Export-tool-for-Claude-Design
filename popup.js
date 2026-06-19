@@ -12,31 +12,16 @@ function setBusy(busy) {
   pdfBtn.disabled = busy;
 }
 
-// Get the design iframe src from the current tab
-async function getIframeSrc(tabId) {
-  const [{ result }] = await chrome.scripting.executeScript({
-    target: { tabId },
-    func: () => {
-      // Find the largest non-blank iframe (the design preview)
-      const frames = Array.from(document.querySelectorAll('iframe'))
-        .filter(f => f.src && f.src.startsWith('http'))
-        .sort((a, b) => (b.clientWidth * b.clientHeight) - (a.clientWidth * a.clientHeight));
-      return frames[0]?.src ?? null;
-    },
-  });
-  return result;
-}
-
-// Receive progress updates from the service worker
+// Status updates from service worker
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.action !== 'exportStatus') return;
   setStatus(msg.message, msg.type || '');
-  setBusy(msg.busy);
+  setBusy(!!msg.busy);
 });
 
 async function runExport(format) {
   setBusy(true);
-  setStatus('Looking for design…');
+  setStatus('Starting…');
   const scale = parseInt(scaleSelect.value, 10);
 
   try {
@@ -47,34 +32,24 @@ async function runExport(format) {
       return;
     }
 
-    // Try SVG/canvas fast-path for regular artifact pages
+    // SVG/canvas fast-path for regular artifact pages
     let direct = null;
     try {
-      direct = await chrome.tabs.sendMessage(tab.id, {
-        action: format === 'pdf' ? 'exportPdf' : 'exportPng', scale,
-      });
-    } catch (_) { /* no content script or no SVG found */ }
-
+      direct = await chrome.tabs.sendMessage(tab.id, { action: 'exportPng', scale });
+    } catch (_) {}
     if (direct?.success) {
       setStatus('Saved! Check your downloads.', 'success');
       setBusy(false);
       return;
     }
 
-    // HTML design path — hand off to service worker (survives popup close)
-    const iframeSrc = await getIframeSrc(tab.id);
-    if (!iframeSrc) {
-      setStatus('No design found. Make sure the design is fully loaded.', 'error');
-      setBusy(false);
-      return;
-    }
-
-    setStatus('Starting export…');
-    // Service worker takes over from here and sends back status updates
-    chrome.runtime.sendMessage({ action: 'export', format, scale, iframeSrc });
+    // Hand off to service worker — it attaches the debugger to THIS tab
+    // and clips to the already-rendered iframe (no new tab opened)
+    setStatus('Capturing…');
+    chrome.runtime.sendMessage({ action: 'export', format, scale, tabId: tab.id });
 
   } catch (e) {
-    setStatus(e.message || 'Unexpected error.', 'error');
+    setStatus(e.message || 'Error.', 'error');
     setBusy(false);
   }
 }
