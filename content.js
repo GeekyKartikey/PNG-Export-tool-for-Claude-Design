@@ -228,13 +228,69 @@ async function exportPdf() {
   }
 }
 
+// Find the design preview container for screenshot-based export (HTML designs)
+function getDesignBounds() {
+  // Iframes are the most likely container for Claude Design HTML renders
+  const iframes = Array.from(document.querySelectorAll('iframe'))
+    .map(el => ({ el, rect: el.getBoundingClientRect() }))
+    .filter(({ rect }) => rect.width > 300 && rect.height > 300)
+    .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
+
+  if (iframes.length > 0) {
+    const { rect } = iframes[0];
+    return { left: rect.left, top: rect.top, width: rect.width, height: rect.height, dpr: window.devicePixelRatio || 1 };
+  }
+
+  // Fallback: common Claude Design preview container selectors
+  const selectors = [
+    '[class*="preview"]', '[class*="render"]', '[class*="artifact"]',
+    '[class*="output"]', '[class*="canvas"]', '[class*="frame"]',
+  ];
+  for (const sel of selectors) {
+    for (const el of document.querySelectorAll(sel)) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 300 && rect.height > 300) {
+        return { left: rect.left, top: rect.top, width: rect.width, height: rect.height, dpr: window.devicePixelRatio || 1 };
+      }
+    }
+  }
+
+  // Last resort: walk up from a point in the right-centre of the viewport
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  let el = document.elementFromPoint(vw * 0.65, vh * 0.5);
+  while (el && el !== document.body) {
+    const rect = el.getBoundingClientRect();
+    if (rect.width > vw * 0.3 && rect.height > vh * 0.4) {
+      return { left: rect.left, top: rect.top, width: rect.width, height: rect.height, dpr: window.devicePixelRatio || 1 };
+    }
+    el = el.parentElement;
+  }
+
+  return null;
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.action === 'exportPng') {
-    exportPng(msg.scale || 1).then(sendResponse);
+    exportPng(msg.scale || 1).then(result => {
+      if (!result.success) {
+        const bounds = getDesignBounds();
+        sendResponse({ ...result, needsScreenshot: !!bounds, bounds, dpr: window.devicePixelRatio || 1 });
+      } else {
+        sendResponse(result);
+      }
+    });
     return true;
   }
   if (msg.action === 'exportPdf') {
-    exportPdf().then(sendResponse);
+    exportPdf().then(result => {
+      if (!result.success) {
+        const bounds = getDesignBounds();
+        sendResponse({ ...result, needsScreenshot: !!bounds, bounds, dpr: window.devicePixelRatio || 1 });
+      } else {
+        sendResponse(result);
+      }
+    });
     return true;
   }
 });
