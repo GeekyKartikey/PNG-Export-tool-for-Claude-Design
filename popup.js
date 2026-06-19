@@ -20,50 +20,78 @@ function triggerDownload(url, filename) {
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
 }
 
-// Find the iframe that holds the Claude Design HTML file
-async function findDesignFrame(tabId) {
-  const frames = await chrome.webNavigation.getAllFrames({ tabId });
-  const subframes = frames.filter(f => f.parentFrameId !== -1 && f.url && f.url !== 'about:blank');
-  if (!subframes.length) return null;
-  // Prefer frames whose URL contains .dc.html or /design/
-  subframes.sort((a, b) => {
-    const score = f => (f.url.includes('.dc.html') ? 2 : f.url.includes('/design/') ? 1 : 0);
-    return score(b) - score(a);
-  });
-  return subframes[0];
-}
-
-// Inject html2canvas into the target frame and capture the full document
-async function captureFrame(tabId, frameId, scale) {
-  await chrome.scripting.executeScript({
-    target: { tabId, frameIds: [frameId] },
-    files: ['html2canvas.min.js'],
-  });
-
-  const results = await chrome.scripting.executeScript({
-    target: { tabId, frameIds: [frameId] },
-    func: async (pixelScale) => {
-      const root = document.documentElement;
-      const w = Math.max(root.scrollWidth, root.clientWidth, document.body?.scrollWidth || 0);
-      const h = Math.max(root.scrollHeight, root.clientHeight, document.body?.scrollHeight || 0);
-      const canvas = await window.html2canvas(root, {
-        width: w, height: h,
-        windowWidth: w, windowHeight: h,
-        scale: pixelScale,
-        useCORS: true,
-        allowTaint: true,
-        logging: false,
-        backgroundColor: '#ffffff',
-      });
-      return { dataUrl: canvas.toDataURL('image/png'), width: w, height: h };
+// Get the design iframe's src from the main page (runs in main-frame context, not the sandbox)
+async function getDesignIframeSrc(tabId) {
+  const [{ result }] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => {
+      const iframes = Array.from(document.querySelectorAll('iframe'))
+        .filter(f => f.src && f.src.startsWith('http'))
+        .sort((a, b) => (b.clientWidth * b.clientHeight) - (a.clientWidth * a.clientHeight));
+      return iframes[0]?.src ?? null;
     },
-    args: [scale],
   });
-
-  return results[0].result; // { dataUrl, width, height }
+  return result;
 }
 
-// Build PDF with page dimensions exactly matching the design (1 CSS px = 1 PDF pt)
+// Wait for a tab to finish loading (with timeout)
+function waitForTabLoad(tabId, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(fn);
+      reject(new Error('Design page took too long to load.'));
+    }, timeoutMs);
+    function fn(id, info) {
+      if (id === tabId && info.status === 'complete') {
+        chrome.tabs.onUpdated.removeListener(fn);
+        clearTimeout(timer);
+        resolve();
+      }
+    }
+    chrome.tabs.onUpdated.addListener(fn);
+  });
+}
+
+// Open the design URL in a background tab, inject html2canvas, capture, close
+async function captureDesignUrl(designUrl, scale) {
+  const tab = await chrome.tabs.create({ url: designUrl, active: false });
+  try {
+    await waitForTabLoad(tab.id);
+    // Brief pause so fonts/images finish rendering after DOMContentLoaded
+    await new Promise(r => setTimeout(r, 1200));
+
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      files: ['html2canvas.min.js'],
+    });
+
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: async (pixelScale) => {
+        const root = document.documentElement;
+        const w = Math.max(root.scrollWidth, root.clientWidth);
+        const h = Math.max(root.scrollHeight, root.clientHeight);
+        const canvas = await window.html2canvas(root, {
+          width: w, height: h,
+          windowWidth: w, windowHeight: h,
+          scale: pixelScale,
+          useCORS: true,
+          allowTaint: true,
+          logging: false,
+          backgroundColor: '#ffffff',
+        });
+        return { dataUrl: canvas.toDataURL('image/png'), width: w, height: h };
+      },
+      args: [scale],
+    });
+
+    return result;
+  } finally {
+    chrome.tabs.remove(tab.id).catch(() => {});
+  }
+}
+
+// Build PDF with page = exact design CSS dimensions (1 CSS px = 1 PDF pt)
 function buildPdf(jpegDataUrl, imgW, imgH, ptW, ptH) {
   const imgBytes = Uint8Array.from(atob(jpegDataUrl.split(',')[1]), c => c.charCodeAt(0));
   const enc = new TextEncoder();
@@ -103,26 +131,29 @@ async function runExport(format) {
       return;
     }
 
-    // 1. Try SVG/canvas fast-path via content script
-    const direct = await chrome.tabs.sendMessage(tab.id, { action: format === 'pdf' ? 'exportPdf' : 'exportPng', scale });
+    // Fast-path: SVG/canvas artifacts (regular claude.ai, not claude.ai/design)
+    let direct;
+    try {
+      direct = await chrome.tabs.sendMessage(tab.id, { action: format === 'pdf' ? 'exportPdf' : 'exportPng', scale });
+    } catch (_) { direct = null; }
+
     if (direct?.success) {
       setStatus('Saved! Check your downloads.', 'success');
       return;
     }
 
-    // 2. HTML design — inject html2canvas into the design iframe and read the file directly
-    setStatus('Reading design file…');
-    const frame = await findDesignFrame(tab.id);
-    console.log('[Claude Export] frames:', await chrome.webNavigation.getAllFrames({ tabId: tab.id }));
-    if (!frame) {
-      setStatus('No design frame found. Make sure the design is fully loaded.', 'error');
+    // HTML design — open the iframe URL as a real tab (bypasses sandbox)
+    setStatus('Finding design URL…');
+    const iframeSrc = await getDesignIframeSrc(tab.id);
+    if (!iframeSrc) {
+      setStatus('No design found. Make sure the design is fully loaded.', 'error');
       return;
     }
 
-    const { dataUrl, width, height } = await captureFrame(tab.id, frame.frameId, scale);
+    setStatus('Rendering design… (this takes a few seconds)');
+    const { dataUrl, width, height } = await captureDesignUrl(iframeSrc, scale);
 
     if (format === 'pdf') {
-      // Convert PNG → JPEG for embedding in PDF
       const img = await loadImage(dataUrl);
       const c = document.createElement('canvas');
       c.width = img.width; c.height = img.height;
@@ -139,12 +170,7 @@ async function runExport(format) {
 
     setStatus('Saved! Check your downloads.', 'success');
   } catch (e) {
-    const msg = e.message || '';
-    if (msg.includes('Could not establish connection')) {
-      setStatus('Refresh claude.ai and try again.', 'error');
-    } else {
-      setStatus(msg || 'Unexpected error.', 'error');
-    }
+    setStatus(e.message || 'Unexpected error.', 'error');
   } finally {
     setBusy(false);
   }
