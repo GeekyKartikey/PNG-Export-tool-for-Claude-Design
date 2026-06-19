@@ -3,7 +3,7 @@
   "name": "PNG Export for Claude Design",
   "version": "1.2.0",
   "description": "Export Claude Design artifacts as PNG or PDF at original size",
-  "permissions": ["activeTab", "downloads", "scripting", "webNavigation", "tabs"],
+  "permissions": ["activeTab", "downloads", "scripting", "webNavigation", "tabs", "debugger"],
   "host_permissions": [
     "*://claude.ai/*",
     "*://*.claudeusercontent.com/*"

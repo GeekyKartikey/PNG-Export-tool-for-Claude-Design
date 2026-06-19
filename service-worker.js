@@ -1,4 +1,6 @@
-// Service worker owns the entire export lifecycle so it survives popup close.
+// Service worker owns the full export lifecycle (survives popup close).
+// Uses the Chrome Debugger API (Page.captureScreenshot) instead of html2canvas —
+// this uses Chrome's own renderer so it works with any CSS, gradients, web fonts, etc.
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -19,7 +21,48 @@ function waitForTabLoad(tabId, timeoutMs = 30000) {
   });
 }
 
-// Convert Uint8Array → base64 without hitting call-stack limits
+// Capture the full page via Chrome DevTools Protocol.
+// Returns { dataUrl, cssWidth, cssHeight, imgW, imgH }
+async function captureWithDebugger(tabId, screenshotFormat, scale) {
+  await chrome.debugger.attach({ tabId }, '1.3');
+  try {
+    // Get the actual rendered content dimensions
+    const metrics = await chrome.debugger.sendCommand({ tabId }, 'Page.getLayoutMetrics');
+    const cssWidth  = Math.ceil(metrics.contentSize.width);
+    const cssHeight = Math.ceil(metrics.contentSize.height);
+
+    if (!cssWidth || !cssHeight) throw new Error('Design rendered with zero dimensions — try waiting for it to fully load.');
+
+    // Expand viewport to the full content size so nothing is clipped
+    await chrome.debugger.sendCommand({ tabId }, 'Emulation.setDeviceMetricsOverride', {
+      width: cssWidth,
+      height: cssHeight,
+      deviceScaleFactor: scale,  // 1 = original px, 2 = double resolution
+      mobile: false,
+    });
+
+    // Give layout a moment to settle after viewport change
+    await sleep(400);
+
+    const params = { format: screenshotFormat, captureBeyondViewport: true };
+    if (screenshotFormat === 'jpeg') params.quality = 95;
+
+    const { data } = await chrome.debugger.sendCommand({ tabId }, 'Page.captureScreenshot', params);
+
+    const mime = screenshotFormat === 'png' ? 'image/png' : 'image/jpeg';
+    return {
+      dataUrl: `data:${mime};base64,${data}`,
+      cssWidth,
+      cssHeight,
+      imgW: Math.round(cssWidth * scale),
+      imgH: Math.round(cssHeight * scale),
+    };
+  } finally {
+    await chrome.debugger.detach({ tabId }).catch(() => {});
+  }
+}
+
+// Convert Uint8Array → base64 without blowing the call stack on large files
 function uint8ToBase64(arr) {
   let out = '';
   const chunk = 8192;
@@ -29,7 +72,7 @@ function uint8ToBase64(arr) {
   return btoa(out);
 }
 
-// Minimal PDF: page dimensions = design CSS dimensions (1 CSS px = 1 PDF pt)
+// Build a minimal PDF. Page size = design CSS dimensions (1 CSS px = 1 PDF pt).
 function buildPdf(jpegDataUrl, imgW, imgH, ptW, ptH) {
   const imgBytes = Uint8Array.from(atob(jpegDataUrl.split(',')[1]), c => c.charCodeAt(0));
   const enc = new TextEncoder();
@@ -58,7 +101,6 @@ function buildPdf(jpegDataUrl, imgW, imgH, ptW, ptH) {
 }
 
 function notify(status) {
-  // Best-effort: popup may already be closed
   chrome.runtime.sendMessage({ action: 'exportStatus', ...status }).catch(() => {});
 }
 
@@ -69,65 +111,26 @@ async function runExport({ format, scale, iframeSrc }) {
     designTab = await chrome.tabs.create({ url: iframeSrc, active: false });
 
     await waitForTabLoad(designTab.id);
-    // Let fonts and layout settle after DOMContentLoaded
-    await sleep(1500);
+    // Allow fonts and any JS-driven layout to finish
+    await sleep(2000);
 
-    notify({ busy: true, message: 'Rendering design…' });
+    notify({ busy: true, message: 'Capturing design…' });
 
-    await chrome.scripting.executeScript({
-      target: { tabId: designTab.id },
-      files: ['html2canvas.min.js'],
-    });
+    // PNG export: capture as PNG directly
+    // PDF export: capture as JPEG (smaller, embeds into PDF without re-encoding)
+    const screenshotFormat = format === 'pdf' ? 'jpeg' : 'png';
+    const { dataUrl, cssWidth, cssHeight, imgW, imgH } = await captureWithDebugger(
+      designTab.id, screenshotFormat, scale
+    );
 
-    const [{ result }] = await chrome.scripting.executeScript({
-      target: { tabId: designTab.id },
-      func: async (pixelScale) => {
-        const root = document.documentElement;
-        const w = Math.max(root.scrollWidth, root.clientWidth);
-        const h = Math.max(root.scrollHeight, root.clientHeight);
-        const canvas = await window.html2canvas(root, {
-          width: w, height: h,
-          windowWidth: w, windowHeight: h,
-          scale: pixelScale,
-          useCORS: true,
-          allowTaint: true,
-          logging: false,
-          backgroundColor: '#ffffff',
-        });
-        return { dataUrl: canvas.toDataURL('image/png'), width: w, height: h };
-      },
-      args: [scale],
-    });
-
-    notify({ busy: true, message: 'Saving…' });
+    notify({ busy: true, message: 'Saving file…' });
 
     if (format === 'pdf') {
-      // Convert PNG → JPEG for smaller PDF file size
-      const [{ result: jpeg }] = await chrome.scripting.executeScript({
-        target: { tabId: designTab.id },
-        func: (pngDataUrl) => {
-          return new Promise(resolve => {
-            const img = new Image();
-            img.onload = () => {
-              const c = document.createElement('canvas');
-              c.width = img.width; c.height = img.height;
-              const ctx = c.getContext('2d');
-              ctx.fillStyle = '#ffffff';
-              ctx.fillRect(0, 0, c.width, c.height);
-              ctx.drawImage(img, 0, 0);
-              resolve({ jpegDataUrl: c.toDataURL('image/jpeg', 0.95), imgW: c.width, imgH: c.height });
-            };
-            img.src = pngDataUrl;
-          });
-        },
-        args: [result.dataUrl],
-      });
-
-      const pdfBytes = buildPdf(jpeg.jpegDataUrl, jpeg.imgW, jpeg.imgH, result.width, result.height);
-      const pdfDataUrl = 'data:application/pdf;base64,' + uint8ToBase64(pdfBytes);
+      const pdfBytes = buildPdf(dataUrl, imgW, imgH, cssWidth, cssHeight);
+      const pdfDataUrl = `data:application/pdf;base64,${uint8ToBase64(pdfBytes)}`;
       await chrome.downloads.download({ url: pdfDataUrl, filename: 'claude-design.pdf', saveAs: false });
     } else {
-      await chrome.downloads.download({ url: result.dataUrl, filename: 'claude-design.png', saveAs: false });
+      await chrome.downloads.download({ url: dataUrl, filename: 'claude-design.png', saveAs: false });
     }
 
     notify({ busy: false, message: 'Saved! Check your downloads.', type: 'success' });
