@@ -113,6 +113,7 @@ async function runExport(format) {
     // 2. HTML design — inject html2canvas into the design iframe and read the file directly
     setStatus('Reading design file…');
     const frame = await findDesignFrame(tab.id);
+    console.log('[Claude Export] frames:', await chrome.webNavigation.getAllFrames({ tabId: tab.id }));
     if (!frame) {
       setStatus('No design frame found. Make sure the design is fully loaded.', 'error');
       return;
