@@ -1,26 +1,28 @@
-// Fast-path for SVG/canvas artifacts on regular claude.ai pages.
-// claude.ai/design pages use HTML iframes — handled by the service worker instead.
+// Fast-path for SVG/canvas artifacts on REGULAR claude.ai artifact pages.
+// claude.ai/design pages use HTML iframes and are handled by the service worker;
+// popup.js never calls this on a /design page. To avoid grabbing a stray
+// claude.ai UI icon, we only match elements inside an actual artifact container.
+
+const ARTIFACT_CONTAINERS = [
+  '[data-testid*="artifact"]',
+  '[class*="artifact"]',
+  '[class*="preview"]',
+];
 
 function findDesignElement() {
-  const prioritySelectors = [
-    '[data-testid*="artifact"] svg',
-    '[class*="artifact"] svg',
-    '[class*="preview"] svg',
-  ];
-  for (const sel of prioritySelectors) {
-    const el = document.querySelector(sel);
-    if (el) return { el, type: 'svg' };
+  for (const container of ARTIFACT_CONTAINERS) {
+    for (const root of document.querySelectorAll(container)) {
+      const svg = Array.from(root.querySelectorAll('svg'))
+        .filter(s => s.clientWidth > 100 && s.clientHeight > 100)
+        .sort((a, b) => (b.clientWidth * b.clientHeight) - (a.clientWidth * a.clientHeight))[0];
+      if (svg) return { el: svg, type: 'svg' };
+
+      const canvas = Array.from(root.querySelectorAll('canvas'))
+        .filter(c => c.width > 100 && c.height > 100)
+        .sort((a, b) => (b.width * b.height) - (a.width * a.height))[0];
+      if (canvas) return { el: canvas, type: 'canvas' };
+    }
   }
-  const svgs = Array.from(document.querySelectorAll('svg'))
-    .filter(s => s.clientWidth > 100 && s.clientHeight > 100)
-    .sort((a, b) => (b.clientWidth * b.clientHeight) - (a.clientWidth * a.clientHeight));
-  if (svgs.length) return { el: svgs[0], type: 'svg' };
-
-  const canvases = Array.from(document.querySelectorAll('canvas'))
-    .filter(c => c.width > 100 && c.height > 100)
-    .sort((a, b) => (b.width * b.height) - (a.width * a.height));
-  if (canvases.length) return { el: canvases[0], type: 'canvas' };
-
   return null;
 }
 
@@ -42,7 +44,7 @@ function svgToCanvas(svgEl, scale) {
       ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
       ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
       URL.revokeObjectURL(url);
-      resolve({ canvas, width: w, height: h });
+      resolve(canvas);
     };
     img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('SVG render failed.')); };
     img.src = url;
@@ -56,12 +58,17 @@ function triggerDownload(url, filename) {
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg.action !== 'exportPng' && msg.action !== 'exportPdf') return;
+  if (msg.action !== 'exportPng') return;
   (async () => {
     const found = findDesignElement();
     if (!found) { sendResponse({ success: false }); return; }
     try {
-      const { canvas } = await svgToCanvas(found.el, msg.scale || 1);
+      let canvas;
+      if (found.type === 'canvas') {
+        canvas = found.el; // already a rasterized canvas
+      } else {
+        canvas = await svgToCanvas(found.el, msg.scale || 1);
+      }
       triggerDownload(canvas.toDataURL('image/png'), 'claude-design.png');
       sendResponse({ success: true });
     } catch (e) {

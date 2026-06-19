@@ -19,6 +19,14 @@ chrome.runtime.onMessage.addListener((msg) => {
   setBusy(!!msg.busy);
 });
 
+// Restore the last status if the popup was reopened after closing mid-export.
+chrome.storage.session.get('lastStatus').then(({ lastStatus }) => {
+  if (lastStatus && !statusEl.textContent) {
+    setStatus(lastStatus.message, lastStatus.type || '');
+    setBusy(!!lastStatus.busy);
+  }
+}).catch(() => {});
+
 async function runExport(format) {
   setBusy(true);
   setStatus('Starting…');
@@ -32,15 +40,21 @@ async function runExport(format) {
       return;
     }
 
-    // SVG/canvas fast-path for regular artifact pages
-    let direct = null;
-    try {
-      direct = await chrome.tabs.sendMessage(tab.id, { action: 'exportPng', scale });
-    } catch (_) {}
-    if (direct?.success) {
-      setStatus('Saved! Check your downloads.', 'success');
-      setBusy(false);
-      return;
+    // On a Design page the artifact is an HTML iframe — always use the debugger
+    // capture path. The SVG/canvas fast-path is only for regular artifact pages,
+    // where it must NOT run on /design (it would grab a stray claude.ai SVG and
+    // download the wrong thing).
+    const isDesign = /\/design\//.test(tab.url) || /\.dc\.html/.test(tab.url);
+    if (!isDesign && format === 'png') {
+      let direct = null;
+      try {
+        direct = await chrome.tabs.sendMessage(tab.id, { action: 'exportPng', scale });
+      } catch (_) {}
+      if (direct?.success) {
+        setStatus('Saved! Check your downloads.', 'success');
+        setBusy(false);
+        return;
+      }
     }
 
     // Hand off to service worker — it attaches the debugger to THIS tab
