@@ -1,10 +1,13 @@
 {
   "manifest_version": 3,
   "name": "PNG Export for Claude Design",
-  "version": "1.0.0",
-  "description": "Export Claude Design artifacts as PNG at original size",
+  "version": "1.2.0",
+  "description": "Export Claude Design artifacts as PNG or PDF at original size",
   "permissions": ["activeTab", "downloads", "scripting", "webNavigation", "tabs"],
-  "host_permissions": ["*://claude.ai/*"],
+  "host_permissions": [
+    "*://claude.ai/*",
+    "*://*.claudeusercontent.com/*"
+  ],
   "action": {
     "default_popup": "popup.html",
     "default_icon": {
@@ -17,6 +20,9 @@
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
+  },
+  "background": {
+    "service_worker": "service-worker.js"
   },
   "content_scripts": [
     {
