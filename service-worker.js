@@ -1,6 +1,6 @@
-// Captures the already-rendered Claude Design iframe. Before screenshotting, it
-// temporarily hides Claude editor/export overlays in the parent page and tweak
-// controls inside the design frame, then restores the page immediately after.
+// Captures the Claude Design document from the claudeusercontent.com iframe's
+// own debugger target. Capturing the parent Claude tab only sees the currently
+// visible iframe viewport, so full-artboard export must happen inside the frame.
 
 const ALLOWED_FORMATS = new Set(['png', 'pdf']);
 const ALLOWED_SCALES = new Set([1, 2, 3]);
@@ -27,9 +27,13 @@ function withTimeout(promise, ms, label) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
-function debuggerCommand(tabId, method, params = {}, timeoutMs = DEBUGGER_COMMAND_TIMEOUT_MS) {
+function debuggerTarget(target) {
+  return typeof target === 'number' ? { tabId: target } : target;
+}
+
+function debuggerCommand(target, method, params = {}, timeoutMs = DEBUGGER_COMMAND_TIMEOUT_MS) {
   return withTimeout(
-    chrome.debugger.sendCommand({ tabId }, method, params),
+    chrome.debugger.sendCommand(debuggerTarget(target), method, params),
     timeoutMs,
     method
   );
@@ -53,6 +57,14 @@ function isClaudeusercontentUrl(rawUrl) {
       hostname.endsWith('.claudeusercontent.com');
   } catch {
     return false;
+  }
+}
+
+function urlsMatch(a, b) {
+  try {
+    return new URL(a).href === new URL(b).href;
+  } catch {
+    return a === b;
   }
 }
 
@@ -147,117 +159,6 @@ function assertCaptureSize(rect, scale) {
   }
 }
 
-function flattenFrameTree(node, out = []) {
-  if (!node) return out;
-  if (node.frame) out.push(node.frame);
-  for (const child of node.childFrames || []) flattenFrameTree(child, out);
-  return out;
-}
-
-async function getClaudeFrameId(tabId, iframeSrc) {
-  try {
-    const { frameTree } = await debuggerCommand(tabId, 'Page.getFrameTree');
-    const frames = flattenFrameTree(frameTree);
-    const exact = frames.find(frame => frame.url === iframeSrc);
-    if (exact) return exact.id;
-    return frames.find(frame => isClaudeusercontentUrl(frame.url))?.id || null;
-  } catch {
-    return null;
-  }
-}
-
-async function installParentCaptureMask(tabId, rect) {
-  await debuggerCommand(tabId, 'Runtime.evaluate', {
-    awaitPromise: true,
-    returnByValue: true,
-    expression: `(async function(){
-      const STYLE_ID = ${JSON.stringify(CAPTURE_STYLE_ID)};
-      const HIDE_ATTR = ${JSON.stringify(CAPTURE_HIDDEN_ATTR)};
-      const clip = ${JSON.stringify(rect)};
-      const old = document.getElementById(STYLE_ID);
-      if (old) old.remove();
-
-      const style = document.createElement('style');
-      style.id = STYLE_ID;
-      style.textContent = [
-        '#claude-png-export-card { visibility: hidden !important; }',
-        '[role="dialog"] { visibility: hidden !important; }',
-        '[data-radix-popper-content-wrapper] { visibility: hidden !important; }',
-        '[data-testid*="popover" i] { visibility: hidden !important; }'
-      ].join('\\n');
-      document.documentElement.appendChild(style);
-
-      const frame = Array.from(document.querySelectorAll('iframe'))
-        .filter(f => {
-          try {
-            const host = new URL(f.src, document.baseURI).hostname;
-            return host === 'claudeusercontent.com' || host.endsWith('.claudeusercontent.com');
-          } catch (_) {
-            return false;
-          }
-        })
-        .sort((a, b) => {
-          const ar = a.getBoundingClientRect();
-          const br = b.getBoundingClientRect();
-          return (br.width * br.height) - (ar.width * ar.height);
-        })[0];
-
-      const target = {
-        left: clip.x - window.scrollX,
-        top: clip.y - window.scrollY,
-        right: clip.x - window.scrollX + clip.width,
-        bottom: clip.y - window.scrollY + clip.height
-      };
-      function overlap(a, b) {
-        const x = Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left));
-        const y = Math.max(0, Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top));
-        return x * y;
-      }
-      function hide(el) {
-        if (!el || el.hasAttribute(HIDE_ATTR)) return;
-        el.setAttribute(HIDE_ATTR, el.style.visibility || '');
-        el.style.setProperty('visibility', 'hidden', 'important');
-      }
-
-      for (const el of Array.from(document.body.querySelectorAll('*'))) {
-        if (el === frame || el.contains(frame)) continue;
-        const r = el.getBoundingClientRect();
-        if (r.width < 1 || r.height < 1) continue;
-        if (overlap(r, target) < 12) continue;
-        const cs = getComputedStyle(el);
-        const z = Number.parseInt(cs.zIndex, 10);
-        const text = (el.innerText || '').replace(/\\s+/g, ' ').trim();
-        const looksLikeOverlay = cs.position === 'fixed' ||
-          cs.position === 'sticky' ||
-          cs.position === 'absolute' ||
-          Number.isFinite(z) ||
-          /\\b(Tweaks|Export Design|Share link|Send to|Download|PowerPoint|Project archive|Standalone HTML)\\b/i.test(text);
-        if (looksLikeOverlay) hide(el);
-      }
-      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-      return true;
-    })()`,
-  });
-}
-
-async function restoreParentCaptureMask(tabId) {
-  await debuggerCommand(tabId, 'Runtime.evaluate', {
-    returnByValue: true,
-    expression: `(function(){
-      const STYLE_ID = ${JSON.stringify(CAPTURE_STYLE_ID)};
-      const HIDE_ATTR = ${JSON.stringify(CAPTURE_HIDDEN_ATTR)};
-      document.getElementById(STYLE_ID)?.remove();
-      for (const el of Array.from(document.querySelectorAll('[' + HIDE_ATTR + ']'))) {
-        const old = el.getAttribute(HIDE_ATTR);
-        el.removeAttribute(HIDE_ATTR);
-        if (old) el.style.visibility = old;
-        else el.style.removeProperty('visibility');
-      }
-      return true;
-    })()`,
-  }).catch(() => {});
-}
-
 async function notifyFrameCaptureScripts(tabId, action) {
   await withTimeout(
     chrome.tabs.sendMessage(tabId, { action }).catch(() => {}),
@@ -266,24 +167,71 @@ async function notifyFrameCaptureScripts(tabId, action) {
   ).catch(() => {});
 }
 
-async function frameExecutionContext(tabId, frameId) {
-  if (!frameId) return null;
+function pickClaudeTarget(items, iframeSrc) {
+  const candidates = Array.from(items || [])
+    .filter(item => item?.url && isClaudeusercontentUrl(item.url));
+  return candidates.find(item => urlsMatch(item.url, iframeSrc)) ||
+    candidates.find(item => iframeSrc && item.url === iframeSrc) ||
+    candidates[0] ||
+    null;
+}
+
+async function attachClaudeFrameSession(tabId, iframeSrc) {
+  const attached = [];
+  function remember(sessionId, targetInfo) {
+    if (!sessionId || !targetInfo?.url || !isClaudeusercontentUrl(targetInfo.url)) return;
+    attached.push({ sessionId, url: targetInfo.url, targetInfo });
+  }
+
+  function onEvent(source, method, params) {
+    if (source.tabId !== tabId || method !== 'Target.attachedToTarget') return;
+    remember(params?.sessionId, params?.targetInfo);
+    if (params?.sessionId) {
+      const child = { ...source, sessionId: params.sessionId };
+      debuggerCommand(child, 'Runtime.runIfWaitingForDebugger').catch(() => {});
+    }
+  }
+
+  chrome.debugger.onEvent.addListener(onEvent);
   try {
-    const { executionContextId } = await debuggerCommand(tabId, 'Page.createIsolatedWorld', {
-      frameId,
-      worldName: 'claude-design-export',
-      grantUniveralAccess: true,
+    const autoAttachParams = {
+      autoAttach: true,
+      waitForDebuggerOnStart: false,
+      flatten: true,
+      filter: [{ type: 'iframe', exclude: false }],
+    };
+    await debuggerCommand(tabId, 'Target.setAutoAttach', autoAttachParams)
+      .catch(() => debuggerCommand(tabId, 'Target.setAutoAttach', {
+        autoAttach: true,
+        waitForDebuggerOnStart: false,
+        flatten: true,
+      }));
+    await sleep(300);
+
+    const chosen = pickClaudeTarget(attached, iframeSrc);
+    if (chosen) {
+      return { tabId, sessionId: chosen.sessionId };
+    }
+
+    const targets = await debuggerCommand(tabId, 'Target.getTargets', {
+      filter: [{ type: 'iframe', exclude: false }],
+    }).catch(() => debuggerCommand(tabId, 'Target.getTargets').catch(() => null));
+    const targetInfo = pickClaudeTarget(targets?.targetInfos, iframeSrc);
+    const targetId = targetInfo?.targetId || targetInfo?.id;
+    if (!targetId) return null;
+
+    const { sessionId } = await debuggerCommand(tabId, 'Target.attachToTarget', {
+      targetId,
+      flatten: true,
     });
-    return executionContextId || null;
-  } catch {
-    return null;
+    return sessionId ? { tabId, sessionId } : null;
+  } finally {
+    chrome.debugger.onEvent.removeListener(onEvent);
   }
 }
 
-async function installFrameCaptureMask(tabId, contextId) {
-  if (!contextId) return;
-  await debuggerCommand(tabId, 'Runtime.evaluate', {
-    contextId,
+async function installFrameCaptureMask(target) {
+  await debuggerCommand(target, 'Runtime.evaluate', {
     awaitPromise: true,
     returnByValue: true,
     expression: `(async function(){
@@ -339,10 +287,9 @@ async function installFrameCaptureMask(tabId, contextId) {
   }, DEBUGGER_COMMAND_TIMEOUT_MS + DESIGN_READY_TIMEOUT_MS);
 }
 
-async function restoreFrameCaptureMask(tabId, contextId) {
-  if (!contextId) return;
-  await debuggerCommand(tabId, 'Runtime.evaluate', {
-    contextId,
+async function restoreFrameCaptureMask(target) {
+  if (!target) return;
+  await debuggerCommand(target, 'Runtime.evaluate', {
     returnByValue: true,
     expression: `(function(){
       const STYLE_ID = ${JSON.stringify(CAPTURE_STYLE_ID)};
@@ -359,8 +306,82 @@ async function restoreFrameCaptureMask(tabId, contextId) {
   }).catch(() => {});
 }
 
-async function captureScreenshotDataUrl(tabId, clip, scale) {
-  const { data } = await debuggerCommand(tabId, 'Page.captureScreenshot', {
+async function getFrameDocumentClip(target) {
+  await debuggerCommand(target, 'Page.enable').catch(() => {});
+  const { result, exceptionDetails } = await debuggerCommand(target, 'Runtime.evaluate', {
+    awaitPromise: true,
+    returnByValue: true,
+    expression: `JSON.stringify((function(){
+      const doc = document.documentElement;
+      const body = document.body;
+      const scroller = document.scrollingElement || doc || body;
+      const baseWidth = Math.max(
+        window.innerWidth || 0,
+        doc?.clientWidth || 0,
+        doc?.scrollWidth || 0,
+        doc?.offsetWidth || 0,
+        body?.clientWidth || 0,
+        body?.scrollWidth || 0,
+        body?.offsetWidth || 0,
+        scroller?.scrollWidth || 0
+      );
+      const baseHeight = Math.max(
+        window.innerHeight || 0,
+        doc?.clientHeight || 0,
+        doc?.scrollHeight || 0,
+        doc?.offsetHeight || 0,
+        body?.clientHeight || 0,
+        body?.scrollHeight || 0,
+        body?.offsetHeight || 0,
+        scroller?.scrollHeight || 0
+      );
+
+      let minX = 0;
+      let minY = 0;
+      let maxX = baseWidth;
+      let maxY = baseHeight;
+      for (const el of Array.from(document.body?.querySelectorAll('*') || [])) {
+        const cs = getComputedStyle(el);
+        if (cs.display === 'none' || cs.visibility === 'hidden' || Number(cs.opacity) === 0) continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.width < 1 || rect.height < 1) continue;
+        const x1 = rect.left + window.scrollX;
+        const y1 = rect.top + window.scrollY;
+        const x2 = rect.right + window.scrollX;
+        const y2 = rect.bottom + window.scrollY;
+        if (!Number.isFinite(x1 + y1 + x2 + y2)) continue;
+        if (x2 < -10000 || y2 < -10000 || x1 > 100000 || y1 > 100000) continue;
+        minX = Math.min(minX, x1);
+        minY = Math.min(minY, y1);
+        maxX = Math.max(maxX, x2);
+        maxY = Math.max(maxY, y2);
+      }
+
+      const x = Math.max(0, Math.floor(minX));
+      const y = Math.max(0, Math.floor(minY));
+      return {
+        x,
+        y,
+        width: Math.ceil(maxX - x),
+        height: Math.ceil(maxY - y)
+      };
+    })())`,
+  });
+
+  if (exceptionDetails) {
+    throw new Error('Could not measure the design document: ' +
+      (exceptionDetails.exception?.description || exceptionDetails.text || 'in-frame evaluation threw'));
+  }
+
+  const clip = JSON.parse(result.value);
+  if (!clip || clip.width < 100 || clip.height < 100) {
+    throw new Error('Could not determine the full design size.');
+  }
+  return clip;
+}
+
+async function captureScreenshotDataUrl(target, clip, scale) {
+  const { data } = await debuggerCommand(target, 'Page.captureScreenshot', {
     format: 'png',
     captureBeyondViewport: true,
     fromSurface: true,
@@ -398,47 +419,53 @@ async function captureDesignFromTab(tabId, scale) {
     throw new Error('Could not attach to the tab (close DevTools if open): ' + (e.message || e));
   });
 
-  let frameContextId = null;
+  let frameSession = null;
   try {
-    notify({ busy: true, message: 'Finding design area…' });
+    notify({ busy: true, message: 'Finding design document…' });
     const rect = await getIframeRect(tabId);
-    if (!rect || rect.width < 1 || rect.height < 1) {
+    if (!rect?.src || !isClaudeusercontentUrl(rect.src)) {
       throw new Error('No design preview found. Open the design and let it finish rendering.');
     }
-    assertCaptureSize(rect, scale);
 
-    const frameId = await getClaudeFrameId(tabId, rect.src);
-    frameContextId = await frameExecutionContext(tabId, frameId);
+    notify({ busy: true, message: 'Attaching to design frame…' });
+    frameSession = await attachClaudeFrameSession(tabId, rect.src);
+    if (!frameSession) {
+      throw new Error('Could not attach to the Claude design frame. Update Chrome, reload the extension, and try again.');
+    }
 
-    notify({ busy: true, message: 'Hiding editor controls…' });
-    await installParentCaptureMask(tabId, rect);
+    notify({ busy: true, message: 'Preparing full artboard…' });
     await notifyFrameCaptureScripts(tabId, FRAME_PREPARE_ACTION);
-    await installFrameCaptureMask(tabId, frameContextId).catch(() => {});
+    await installFrameCaptureMask(frameSession).catch(() => {});
     await sleep(150);
+    const clip = await getFrameDocumentClip(frameSession);
+    assertCaptureSize(clip, scale);
 
-    notify({ busy: true, message: 'Capturing clean asset…' });
-    const dataUrl = await captureScreenshotDataUrl(tabId, rect, scale);
+    notify({ busy: true, message: 'Capturing full artboard…' });
+    const dataUrl = await captureScreenshotDataUrl(frameSession, clip, scale);
     if (await isMostlyBlank(dataUrl)) {
       throw new Error('Capture came back blank. Make sure the design is fully loaded, then retry.');
     }
 
-    return { dataUrl, usedDirectBounds: false };
+    return { dataUrl, usedDirectBounds: true };
   } finally {
-    await restoreFrameCaptureMask(tabId, frameContextId);
+    await restoreFrameCaptureMask(frameSession);
     await notifyFrameCaptureScripts(tabId, FRAME_RESTORE_ACTION);
-    await restoreParentCaptureMask(tabId);
+    if (frameSession?.sessionId) {
+      await debuggerCommand(tabId, 'Target.detachFromTarget', { sessionId: frameSession.sessionId }).catch(() => {});
+    }
+    await debuggerCommand(tabId, 'Target.setAutoAttach', {
+      autoAttach: false,
+      waitForDebuggerOnStart: false,
+      flatten: true,
+    }).catch(() => {});
     await chrome.debugger.detach({ tabId }).catch(() => {});
   }
 }
 
 // ---- Auto-trim ----
-// The design iframe's element box is the whole preview pane — far larger than
-// the rendered design, which sits in one corner on claude.ai's page background.
-// A raw clip therefore leaves the design marooned in a sea of empty margin
-// (~70% of the image in practice). We can't read the cross-origin iframe's DOM
-// to find the design's true bounds, so we trim the uniform background border off
-// the captured pixels instead. Returns an OffscreenCanvas cropped to the content
-// (or the full image, if the border isn't uniform enough to trim safely).
+// Direct frame-target capture normally uses the frame document size and skips
+// trimming. This conservative pixel trim remains available for future fallbacks:
+// it only removes uniform border/background pixels when doing so looks safe.
 
 // Bounding box of everything that differs from the dominant border color.
 function contentBox(data, W, H) {

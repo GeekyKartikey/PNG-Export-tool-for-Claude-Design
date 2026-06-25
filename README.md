@@ -15,6 +15,9 @@ Claude Design has no built-in PNG export, and its PDF export is unreliable on Ma
 
 The extension icon appears in your toolbar.
 
+Requires Chrome 125 or newer because full-artboard capture uses Chrome
+Debugger child sessions for iframe targets.
+
 ## Usage
 
 1. Go to [claude.ai](https://claude.ai) and open a design (`https://claude.ai/design/…`)
@@ -41,16 +44,18 @@ Instead, the extension captures it the same way DevTools and Puppeteer do:
 
 1. **content.js** injects a **PNG .png** option into Claude's Export panel on `https://claude.ai/design/...`. Selecting it and clicking Claude's **Download** button asks the service worker to export a PNG at 1×.
 2. **popup.js** remains available as a toolbar fallback for PNG/PDF exports and scaled PNG captures.
-3. **service-worker.js** validates the request again, verifies the tab URL, and briefly attaches Chrome Debugger to the current Claude tab only long enough to locate the visible `claudeusercontent.com` design iframe. It never falls back to unrelated iframes.
-4. The worker temporarily hides Claude editor/export overlays in the parent page. **frame-capture.js** also hides generated in-frame tweak panels inside the design document, then both masks are restored immediately after capture.
-5. The worker screenshots the rendered design iframe directly. It does not open the `claudeusercontent.com` document as a separate tab, which avoids blank top-level raw document captures.
-6. Resolution is driven by `clip.scale`; a max-pixel guard prevents oversized screenshots from consuming too much memory. A blank-detection guard reports a clear error instead of silently saving an empty image.
-7. The captured image is conservatively trimmed only when the iframe border/background is uniform enough to identify safe margins. If trimming looks risky, the full iframe capture is preserved instead of over-cropping design edges.
-8. For **PDF**, the bounded asset is JPEG-encoded and embedded in a minimal hand-built PDF whose page size matches the exported asset dimensions (1 CSS px = 1 pt).
-9. **offscreen.js** turns the resulting data URL into a blob URL (a service worker can't call `URL.createObjectURL`, and large `data:` URLs exceed Chrome's download size limit), which `chrome.downloads` then saves.
+3. **service-worker.js** validates the request again, verifies the tab URL, and briefly attaches Chrome Debugger to the current Claude tab only long enough to locate the `claudeusercontent.com` design iframe. It never falls back to unrelated iframes.
+4. The worker attaches to the iframe's own debugger target/session and measures that frame document's full layout size. This is the important part: it does not screenshot the visible parent-page iframe rectangle, so the export is not limited to what is currently visible on screen.
+5. **frame-capture.js** hides generated in-frame tweak panels inside the design document, then the mask is restored immediately after capture.
+6. The worker screenshots the full frame document directly. It does not open the `claudeusercontent.com` document as a separate tab, which avoids blank top-level raw document captures.
+7. Resolution is driven by `clip.scale`; a max-pixel guard prevents oversized screenshots from consuming too much memory. A blank-detection guard reports a clear error instead of silently saving an empty image.
+8. A conservative pixel trim remains available for future fallbacks, but normal exports use the measured frame document bounds to preserve intentional design edges.
+9. For **PDF**, the bounded asset is JPEG-encoded and embedded in a minimal hand-built PDF whose page size matches the exported asset dimensions (1 CSS px = 1 pt).
+10. **offscreen.js** turns the resulting data URL into a blob URL (a service worker can't call `URL.createObjectURL`, and large `data:` URLs exceed Chrome's download size limit), which `chrome.downloads` then saves.
 
-Because the final screenshot comes from the already-rendered design iframe with
-temporary editor masks, floating Claude UI should not appear in exported files.
+Because the final screenshot comes from the design frame's own debugger target,
+the export should include the full artboard rather than only the visible editor
+viewport.
 
 ## Permissions
 

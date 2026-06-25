@@ -1,11 +1,13 @@
 {
   "manifest_version": 3,
   "name": "PNG Export for Claude Design",
-  "version": "1.7.0",
+  "version": "1.8.0",
+  "minimum_chrome_version": "125",
   "description": "Export Claude Design artifacts as PNG or PDF at original size",
   "permissions": ["downloads", "tabs", "debugger", "offscreen", "storage"],
   "host_permissions": [
     "*://claude.ai/*",
+    "*://claudeusercontent.com/*",
     "*://*.claudeusercontent.com/*"
   ],
   "action": {
