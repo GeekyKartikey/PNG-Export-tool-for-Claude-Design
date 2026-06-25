@@ -12,6 +12,10 @@ const TRIM_PADDING_CSS_PX = 4;
 const MIN_TRIM_AREA_RATIO = 0.02;
 const MIN_TRIM_SIDE_RATIO = 0.08;
 const CAPTURE_TAB_LOAD_TIMEOUT_MS = 15000;
+const RAW_CAPTURE_RETRY_COUNT = 6;
+const RAW_CAPTURE_RETRY_DELAY_MS = 500;
+
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
 function isClaudeDesignUrl(rawUrl) {
   try {
@@ -177,10 +181,9 @@ function waitForTabComplete(tabId) {
 }
 
 async function prepareRawDesignDocument(tabId) {
-  // Print media is the closest match to Claude's own PDF/print export path and
-  // usually hides editor-only controls. The extra DOM pass handles tweak panels
-  // that remain mounted outside print styles.
-  await chrome.debugger.sendCommand({ tabId }, 'Emulation.setEmulatedMedia', { media: 'print' }).catch(() => {});
+  // Keep normal screen media for raw .dc.html documents. Print emulation can
+  // blank Claude's generated app; targeted DOM/CSS cleanup handles tweak UI.
+  await chrome.debugger.sendCommand({ tabId }, 'Emulation.setEmulatedMedia', { media: 'screen' }).catch(() => {});
   await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
     awaitPromise: true,
     returnByValue: true,
@@ -228,6 +231,44 @@ async function getRawDocumentClip(tabId) {
   return clip;
 }
 
+async function captureScreenshotDataUrl(tabId, clip, scale) {
+  const { data } = await chrome.debugger.sendCommand({ tabId }, 'Page.captureScreenshot', {
+    format: 'png',
+    captureBeyondViewport: true,
+    fromSurface: true,
+    clip: { ...clip, scale },
+  });
+  return `data:image/png;base64,${data}`;
+}
+
+async function captureNonBlankRawDocument(tabId, scale) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= RAW_CAPTURE_RETRY_COUNT; attempt++) {
+    if (attempt > 1) {
+      notify({ busy: true, message: 'Waiting for design to paint…' });
+      await sleep(RAW_CAPTURE_RETRY_DELAY_MS);
+      if (attempt === 2) {
+        await chrome.debugger.sendCommand({ tabId }, 'Page.bringToFront').catch(() => {});
+      }
+    }
+
+    try {
+      await prepareRawDesignDocument(tabId);
+      const clip = await getRawDocumentClip(tabId);
+      assertCaptureSize(clip, scale);
+      const dataUrl = await captureScreenshotDataUrl(tabId, clip, scale);
+      if (!(await isMostlyBlank(dataUrl))) return dataUrl;
+    } catch (e) {
+      lastError = e;
+    }
+  }
+
+  if (lastError) {
+    console.warn('Raw document capture failed before nonblank paint:', lastError);
+  }
+  throw new Error('Capture came back blank. Make sure the design is fully loaded, then retry.');
+}
+
 async function captureRawDesignUrl(designUrl, scale) {
   if (!isClaudeusercontentUrl(designUrl)) {
     throw new Error('Invalid design document URL.');
@@ -243,22 +284,8 @@ async function captureRawDesignUrl(designUrl, scale) {
     });
     attached = true;
 
-    await prepareRawDesignDocument(tab.id);
-    const clip = await getRawDocumentClip(tab.id);
-    assertCaptureSize(clip, scale);
-
     notify({ busy: true, message: 'Capturing clean asset…' });
-    const { data } = await chrome.debugger.sendCommand({ tabId: tab.id }, 'Page.captureScreenshot', {
-      format: 'png',
-      captureBeyondViewport: true,
-      fromSurface: true,
-      clip: { ...clip, scale },
-    });
-    const dataUrl = `data:image/png;base64,${data}`;
-
-    if (await isMostlyBlank(dataUrl)) {
-      throw new Error('Capture came back blank. Make sure the design is fully loaded, then retry.');
-    }
+    const dataUrl = await captureNonBlankRawDocument(tab.id, scale);
 
     return { dataUrl, usedDirectBounds: true };
   } finally {
