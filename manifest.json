@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "PNG Export for Claude Design",
-  "version": "1.6.2",
+  "version": "1.7.0",
   "description": "Export Claude Design artifacts as PNG or PDF at original size",
   "permissions": ["downloads", "tabs", "debugger", "offscreen", "storage"],
   "host_permissions": [
@@ -28,6 +28,16 @@
     {
       "matches": ["https://claude.ai/design/*"],
       "js": ["content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://claudeusercontent.com/*",
+        "https://*.claudeusercontent.com/*"
+      ],
+      "js": ["frame-capture.js"],
+      "all_frames": true,
+      "match_about_blank": true,
       "run_at": "document_idle"
     }
   ]

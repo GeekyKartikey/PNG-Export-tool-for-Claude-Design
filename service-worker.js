@@ -1,8 +1,6 @@
-// Captures the Claude Design artifact by locating the sandboxed
-// claudeusercontent.com design URL, loading that raw document in a temporary
-// inactive tab, and screenshotting the clean document rather than the visible
-// Claude editor surface. Capturing the editor tab itself includes floating UI
-// overlays such as Tweaks panels, so it can never be a reliable asset export.
+// Captures the already-rendered Claude Design iframe. Before screenshotting, it
+// temporarily hides Claude editor/export overlays in the parent page and tweak
+// controls inside the design frame, then restores the page immediately after.
 
 const ALLOWED_FORMATS = new Set(['png', 'pdf']);
 const ALLOWED_SCALES = new Set([1, 2, 3]);
@@ -11,12 +9,13 @@ const MAX_CAPTURE_PIXELS = 32_000_000;
 const TRIM_PADDING_CSS_PX = 4;
 const MIN_TRIM_AREA_RATIO = 0.02;
 const MIN_TRIM_SIDE_RATIO = 0.08;
-const CAPTURE_TAB_LOAD_TIMEOUT_MS = 15000;
-const RAW_CAPTURE_RETRY_COUNT = 6;
-const RAW_CAPTURE_RETRY_DELAY_MS = 500;
 const DEBUGGER_COMMAND_TIMEOUT_MS = 10000;
 const SCREENSHOT_TIMEOUT_MS = 15000;
-const RAW_DOCUMENT_READY_TIMEOUT_MS = 5000;
+const DESIGN_READY_TIMEOUT_MS = 5000;
+const CAPTURE_STYLE_ID = 'claude-png-export-capture-style';
+const CAPTURE_HIDDEN_ATTR = 'data-claude-png-export-hidden-visibility';
+const FRAME_PREPARE_ACTION = 'claudePngPrepareFrameCapture';
+const FRAME_RESTORE_ACTION = 'claudePngRestoreFrameCapture';
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
@@ -148,112 +147,216 @@ function assertCaptureSize(rect, scale) {
   }
 }
 
-async function getDesignUrlFromClaudeTab(tabId) {
-  await chrome.debugger.attach({ tabId }, '1.3').catch((e) => {
-    throw new Error('Could not inspect the Claude tab (close DevTools if open): ' + (e.message || e));
-  });
+function flattenFrameTree(node, out = []) {
+  if (!node) return out;
+  if (node.frame) out.push(node.frame);
+  for (const child of node.childFrames || []) flattenFrameTree(child, out);
+  return out;
+}
+
+async function getClaudeFrameId(tabId, iframeSrc) {
   try {
-    notify({ busy: true, message: 'Finding design document…' });
-    const rect = await getIframeRect(tabId);
-    if (!rect?.src || !isClaudeusercontentUrl(rect.src)) {
-      throw new Error('No design preview found. Open the design and let it finish rendering.');
-    }
-    return rect.src;
-  } finally {
-    await chrome.debugger.detach({ tabId }).catch(() => {});
+    const { frameTree } = await debuggerCommand(tabId, 'Page.getFrameTree');
+    const frames = flattenFrameTree(frameTree);
+    const exact = frames.find(frame => frame.url === iframeSrc);
+    if (exact) return exact.id;
+    return frames.find(frame => isClaudeusercontentUrl(frame.url))?.id || null;
+  } catch {
+    return null;
   }
 }
 
-function waitForTabComplete(tabId) {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      chrome.tabs.onUpdated.removeListener(onUpdated);
-      reject(new Error('Timed out loading the design document.'));
-    }, CAPTURE_TAB_LOAD_TIMEOUT_MS);
-
-    function finish() {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      chrome.tabs.onUpdated.removeListener(onUpdated);
-      resolve();
-    }
-
-    function onUpdated(updatedTabId, info) {
-      if (updatedTabId === tabId && info.status === 'complete') finish();
-    }
-
-    chrome.tabs.onUpdated.addListener(onUpdated);
-    chrome.tabs.get(tabId).then((tab) => {
-      if (tab.status === 'complete') finish();
-    }).catch((e) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      chrome.tabs.onUpdated.removeListener(onUpdated);
-      reject(e);
-    });
-  });
-}
-
-async function prepareRawDesignDocument(tabId) {
-  // Keep normal screen media for raw .dc.html documents. Print emulation can
-  // blank Claude's generated app; targeted DOM/CSS cleanup handles tweak UI.
-  await debuggerCommand(tabId, 'Emulation.setEmulatedMedia', { media: 'screen' }).catch(() => {});
+async function installParentCaptureMask(tabId, rect) {
   await debuggerCommand(tabId, 'Runtime.evaluate', {
     awaitPromise: true,
     returnByValue: true,
     expression: `(async function(){
+      const STYLE_ID = ${JSON.stringify(CAPTURE_STYLE_ID)};
+      const HIDE_ATTR = ${JSON.stringify(CAPTURE_HIDDEN_ATTR)};
+      const clip = ${JSON.stringify(rect)};
+      const old = document.getElementById(STYLE_ID);
+      if (old) old.remove();
+
       const style = document.createElement('style');
-      style.textContent = '@media screen, print { [data-testid*="tweak" i], [aria-label*="tweak" i] { display: none !important; } }';
+      style.id = STYLE_ID;
+      style.textContent = [
+        '#claude-png-export-card { visibility: hidden !important; }',
+        '[role="dialog"] { visibility: hidden !important; }',
+        '[data-radix-popper-content-wrapper] { visibility: hidden !important; }',
+        '[data-testid*="popover" i] { visibility: hidden !important; }'
+      ].join('\\n');
       document.documentElement.appendChild(style);
 
+      const frame = Array.from(document.querySelectorAll('iframe'))
+        .filter(f => {
+          try {
+            const host = new URL(f.src, document.baseURI).hostname;
+            return host === 'claudeusercontent.com' || host.endsWith('.claudeusercontent.com');
+          } catch (_) {
+            return false;
+          }
+        })
+        .sort((a, b) => {
+          const ar = a.getBoundingClientRect();
+          const br = b.getBoundingClientRect();
+          return (br.width * br.height) - (ar.width * ar.height);
+        })[0];
+
+      const target = {
+        left: clip.x - window.scrollX,
+        top: clip.y - window.scrollY,
+        right: clip.x - window.scrollX + clip.width,
+        bottom: clip.y - window.scrollY + clip.height
+      };
+      function overlap(a, b) {
+        const x = Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left));
+        const y = Math.max(0, Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top));
+        return x * y;
+      }
+      function hide(el) {
+        if (!el || el.hasAttribute(HIDE_ATTR)) return;
+        el.setAttribute(HIDE_ATTR, el.style.visibility || '');
+        el.style.setProperty('visibility', 'hidden', 'important');
+      }
+
+      for (const el of Array.from(document.body.querySelectorAll('*'))) {
+        if (el === frame || el.contains(frame)) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width < 1 || r.height < 1) continue;
+        if (overlap(r, target) < 12) continue;
+        const cs = getComputedStyle(el);
+        const z = Number.parseInt(cs.zIndex, 10);
+        const text = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+        const looksLikeOverlay = cs.position === 'fixed' ||
+          cs.position === 'sticky' ||
+          cs.position === 'absolute' ||
+          Number.isFinite(z) ||
+          /\\b(Tweaks|Export Design|Share link|Send to|Download|PowerPoint|Project archive|Standalone HTML)\\b/i.test(text);
+        if (looksLikeOverlay) hide(el);
+      }
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      return true;
+    })()`,
+  });
+}
+
+async function restoreParentCaptureMask(tabId) {
+  await debuggerCommand(tabId, 'Runtime.evaluate', {
+    returnByValue: true,
+    expression: `(function(){
+      const STYLE_ID = ${JSON.stringify(CAPTURE_STYLE_ID)};
+      const HIDE_ATTR = ${JSON.stringify(CAPTURE_HIDDEN_ATTR)};
+      document.getElementById(STYLE_ID)?.remove();
+      for (const el of Array.from(document.querySelectorAll('[' + HIDE_ATTR + ']'))) {
+        const old = el.getAttribute(HIDE_ATTR);
+        el.removeAttribute(HIDE_ATTR);
+        if (old) el.style.visibility = old;
+        else el.style.removeProperty('visibility');
+      }
+      return true;
+    })()`,
+  }).catch(() => {});
+}
+
+async function notifyFrameCaptureScripts(tabId, action) {
+  await withTimeout(
+    chrome.tabs.sendMessage(tabId, { action }).catch(() => {}),
+    DESIGN_READY_TIMEOUT_MS + 1000,
+    'Frame capture cleanup'
+  ).catch(() => {});
+}
+
+async function frameExecutionContext(tabId, frameId) {
+  if (!frameId) return null;
+  try {
+    const { executionContextId } = await debuggerCommand(tabId, 'Page.createIsolatedWorld', {
+      frameId,
+      worldName: 'claude-design-export',
+      grantUniveralAccess: true,
+    });
+    return executionContextId || null;
+  } catch {
+    return null;
+  }
+}
+
+async function installFrameCaptureMask(tabId, contextId) {
+  if (!contextId) return;
+  await debuggerCommand(tabId, 'Runtime.evaluate', {
+    contextId,
+    awaitPromise: true,
+    returnByValue: true,
+    expression: `(async function(){
+      const STYLE_ID = ${JSON.stringify(CAPTURE_STYLE_ID)};
+      const HIDE_ATTR = ${JSON.stringify(CAPTURE_HIDDEN_ATTR)};
+      document.getElementById(STYLE_ID)?.remove();
+      const style = document.createElement('style');
+      style.id = STYLE_ID;
+      style.textContent = [
+        '[data-testid*="tweak" i] { visibility: hidden !important; }',
+        '[aria-label*="tweak" i] { visibility: hidden !important; }',
+        '[class*="tweak" i] { visibility: hidden !important; }',
+        '[role="dialog"] { visibility: hidden !important; }',
+        '[data-radix-popper-content-wrapper] { visibility: hidden !important; }'
+      ].join('\\n');
+      document.documentElement.appendChild(style);
+
+      function hide(el) {
+        if (!el || el.hasAttribute(HIDE_ATTR)) return;
+        el.setAttribute(HIDE_ATTR, el.style.visibility || '');
+        el.style.setProperty('visibility', 'hidden', 'important');
+      }
       for (const el of Array.from(document.querySelectorAll('*'))) {
         const text = (el.innerText || '').replace(/\\s+/g, ' ').trim();
-        if (!text || !/\\bTweaks\\b/i.test(text)) continue;
-        const r = el.getBoundingClientRect();
-        if (r.width > 0 && r.height > 0 && r.width <= 800 && r.height <= 600) {
-          el.style.setProperty('display', 'none', 'important');
+        if (!/\\bTweaks\\b/i.test(text)) continue;
+        let panel = el;
+        while (panel.parentElement) {
+          const r = panel.getBoundingClientRect();
+          if (r.width >= 180 && r.height >= 80 && r.width <= 1000 && r.height <= 800) break;
+          panel = panel.parentElement;
         }
+        hide(panel);
       }
 
       if (document.fonts && document.fonts.ready) {
         await Promise.race([
           document.fonts.ready.catch(() => {}),
-          new Promise(resolve => setTimeout(resolve, ${RAW_DOCUMENT_READY_TIMEOUT_MS}))
+          new Promise(resolve => setTimeout(resolve, ${DESIGN_READY_TIMEOUT_MS}))
         ]);
       }
       await Promise.race([
         Promise.all(Array.from(document.images)
-        .filter(img => !img.complete)
-        .map(img => new Promise(resolve => {
-          img.addEventListener('load', resolve, { once: true });
-          img.addEventListener('error', resolve, { once: true });
-        }))),
-        new Promise(resolve => setTimeout(resolve, ${RAW_DOCUMENT_READY_TIMEOUT_MS}))
+          .filter(img => !img.complete)
+          .map(img => new Promise(resolve => {
+            img.addEventListener('load', resolve, { once: true });
+            img.addEventListener('error', resolve, { once: true });
+          }))),
+        new Promise(resolve => setTimeout(resolve, ${DESIGN_READY_TIMEOUT_MS}))
       ]);
       await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
       return true;
     })()`,
-  }, DEBUGGER_COMMAND_TIMEOUT_MS + RAW_DOCUMENT_READY_TIMEOUT_MS);
+  }, DEBUGGER_COMMAND_TIMEOUT_MS + DESIGN_READY_TIMEOUT_MS);
 }
 
-async function getRawDocumentClip(tabId) {
-  const metrics = await debuggerCommand(tabId, 'Page.getLayoutMetrics');
-  const content = metrics.cssContentSize || metrics.contentSize;
-  const clip = {
-    x: Math.max(0, Math.floor(content?.x || 0)),
-    y: Math.max(0, Math.floor(content?.y || 0)),
-    width: Math.ceil(content?.width || 0),
-    height: Math.ceil(content?.height || 0),
-  };
-  if (clip.width < 100 || clip.height < 100) {
-    throw new Error('Could not determine the design document size.');
-  }
-  return clip;
+async function restoreFrameCaptureMask(tabId, contextId) {
+  if (!contextId) return;
+  await debuggerCommand(tabId, 'Runtime.evaluate', {
+    contextId,
+    returnByValue: true,
+    expression: `(function(){
+      const STYLE_ID = ${JSON.stringify(CAPTURE_STYLE_ID)};
+      const HIDE_ATTR = ${JSON.stringify(CAPTURE_HIDDEN_ATTR)};
+      document.getElementById(STYLE_ID)?.remove();
+      for (const el of Array.from(document.querySelectorAll('[' + HIDE_ATTR + ']'))) {
+        const old = el.getAttribute(HIDE_ATTR);
+        el.removeAttribute(HIDE_ATTR);
+        if (old) el.style.visibility = old;
+        else el.style.removeProperty('visibility');
+      }
+      return true;
+    })()`,
+  }).catch(() => {});
 }
 
 async function captureScreenshotDataUrl(tabId, clip, scale) {
@@ -264,64 +367,6 @@ async function captureScreenshotDataUrl(tabId, clip, scale) {
     clip: { ...clip, scale },
   }, SCREENSHOT_TIMEOUT_MS);
   return `data:image/png;base64,${data}`;
-}
-
-async function captureNonBlankRawDocument(tabId, scale) {
-  let lastError = null;
-  for (let attempt = 1; attempt <= RAW_CAPTURE_RETRY_COUNT; attempt++) {
-    if (attempt > 1) {
-      notify({ busy: true, message: 'Waiting for design to paint…' });
-      await sleep(RAW_CAPTURE_RETRY_DELAY_MS);
-      if (attempt === 2) {
-        await debuggerCommand(tabId, 'Page.bringToFront').catch(() => {});
-      }
-    }
-
-    try {
-      await prepareRawDesignDocument(tabId);
-      const clip = await getRawDocumentClip(tabId);
-      assertCaptureSize(clip, scale);
-      const dataUrl = await captureScreenshotDataUrl(tabId, clip, scale);
-      if (!(await isMostlyBlank(dataUrl))) return dataUrl;
-    } catch (e) {
-      lastError = e;
-    }
-  }
-
-  if (lastError) {
-    console.warn('Raw document capture failed before nonblank paint:', lastError);
-  }
-  throw new Error('Capture came back blank. Make sure the design is fully loaded, then retry.');
-}
-
-async function captureRawDesignUrl(designUrl, scale) {
-  if (!isClaudeusercontentUrl(designUrl)) {
-    throw new Error('Invalid design document URL.');
-  }
-
-  notify({ busy: true, message: 'Opening clean design document…' });
-  const createProps = { url: designUrl, active: true };
-  if (statusTabId != null) createProps.openerTabId = statusTabId;
-  // Chrome may not paint background tabs quickly enough for CDP screenshots.
-  // Open the raw document active, capture it, then close it and restore focus.
-  const tab = await chrome.tabs.create(createProps);
-  let attached = false;
-  try {
-    await waitForTabComplete(tab.id);
-    await chrome.debugger.attach({ tabId: tab.id }, '1.3').catch((e) => {
-      throw new Error('Could not capture the design document: ' + (e.message || e));
-    });
-    attached = true;
-
-    notify({ busy: true, message: 'Capturing clean asset…' });
-    const dataUrl = await captureNonBlankRawDocument(tab.id, scale);
-
-    return { dataUrl, usedDirectBounds: true };
-  } finally {
-    if (attached) await chrome.debugger.detach({ tabId: tab.id }).catch(() => {});
-    await chrome.tabs.remove(tab.id).catch(() => {});
-    if (statusTabId != null) await chrome.tabs.update(statusTabId, { active: true }).catch(() => {});
-  }
 }
 
 // Decode the capture and check whether it's essentially all white/blank, so we
@@ -349,8 +394,41 @@ async function isMostlyBlank(dataUrl) {
 }
 
 async function captureDesignFromTab(tabId, scale) {
-  const designUrl = await getDesignUrlFromClaudeTab(tabId);
-  return captureRawDesignUrl(designUrl, scale);
+  await chrome.debugger.attach({ tabId }, '1.3').catch((e) => {
+    throw new Error('Could not attach to the tab (close DevTools if open): ' + (e.message || e));
+  });
+
+  let frameContextId = null;
+  try {
+    notify({ busy: true, message: 'Finding design area…' });
+    const rect = await getIframeRect(tabId);
+    if (!rect || rect.width < 1 || rect.height < 1) {
+      throw new Error('No design preview found. Open the design and let it finish rendering.');
+    }
+    assertCaptureSize(rect, scale);
+
+    const frameId = await getClaudeFrameId(tabId, rect.src);
+    frameContextId = await frameExecutionContext(tabId, frameId);
+
+    notify({ busy: true, message: 'Hiding editor controls…' });
+    await installParentCaptureMask(tabId, rect);
+    await notifyFrameCaptureScripts(tabId, FRAME_PREPARE_ACTION);
+    await installFrameCaptureMask(tabId, frameContextId).catch(() => {});
+    await sleep(150);
+
+    notify({ busy: true, message: 'Capturing clean asset…' });
+    const dataUrl = await captureScreenshotDataUrl(tabId, rect, scale);
+    if (await isMostlyBlank(dataUrl)) {
+      throw new Error('Capture came back blank. Make sure the design is fully loaded, then retry.');
+    }
+
+    return { dataUrl, usedDirectBounds: false };
+  } finally {
+    await restoreFrameCaptureMask(tabId, frameContextId);
+    await notifyFrameCaptureScripts(tabId, FRAME_RESTORE_ACTION);
+    await restoreParentCaptureMask(tabId);
+    await chrome.debugger.detach({ tabId }).catch(() => {});
+  }
 }
 
 // ---- Auto-trim ----

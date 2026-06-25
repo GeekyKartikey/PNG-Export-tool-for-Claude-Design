@@ -41,14 +41,16 @@ Instead, the extension captures it the same way DevTools and Puppeteer do:
 
 1. **content.js** injects a **PNG .png** option into Claude's Export panel on `https://claude.ai/design/...`. Selecting it and clicking Claude's **Download** button asks the service worker to export a PNG at 1×.
 2. **popup.js** remains available as a toolbar fallback for PNG/PDF exports and scaled PNG captures.
-3. **service-worker.js** validates the request again, verifies the tab URL, and briefly inspects the Claude tab only to find the visible `claudeusercontent.com` design document URL. It never falls back to unrelated iframes.
-4. The worker opens that raw design document in a temporary inactive tab, emulates print media, hides tweak controls that remain mounted, screenshots the clean document bounds, then closes the temporary tab. This avoids capturing Claude editor overlays such as Tweaks, Share, or Export panels.
-5. Resolution is driven by `clip.scale`; a max-pixel guard prevents oversized screenshots from consuming too much memory. A blank-detection guard reports a clear error instead of silently saving an empty image.
-6. For **PDF**, the bounded asset is JPEG-encoded and embedded in a minimal hand-built PDF whose page size matches the exported asset dimensions (1 CSS px = 1 pt).
-7. **offscreen.js** turns the resulting data URL into a blob URL (a service worker can't call `URL.createObjectURL`, and large `data:` URLs exceed Chrome's download size limit), which `chrome.downloads` then saves.
+3. **service-worker.js** validates the request again, verifies the tab URL, and briefly attaches Chrome Debugger to the current Claude tab only long enough to locate the visible `claudeusercontent.com` design iframe. It never falls back to unrelated iframes.
+4. The worker temporarily hides Claude editor/export overlays in the parent page. **frame-capture.js** also hides generated in-frame tweak panels inside the design document, then both masks are restored immediately after capture.
+5. The worker screenshots the rendered design iframe directly. It does not open the `claudeusercontent.com` document as a separate tab, which avoids blank top-level raw document captures.
+6. Resolution is driven by `clip.scale`; a max-pixel guard prevents oversized screenshots from consuming too much memory. A blank-detection guard reports a clear error instead of silently saving an empty image.
+7. The captured image is conservatively trimmed only when the iframe border/background is uniform enough to identify safe margins. If trimming looks risky, the full iframe capture is preserved instead of over-cropping design edges.
+8. For **PDF**, the bounded asset is JPEG-encoded and embedded in a minimal hand-built PDF whose page size matches the exported asset dimensions (1 CSS px = 1 pt).
+9. **offscreen.js** turns the resulting data URL into a blob URL (a service worker can't call `URL.createObjectURL`, and large `data:` URLs exceed Chrome's download size limit), which `chrome.downloads` then saves.
 
-Because the final screenshot comes from the raw design document instead of the
-visible Claude editor, floating editor UI should not appear in exported files.
+Because the final screenshot comes from the already-rendered design iframe with
+temporary editor masks, floating Claude UI should not appear in exported files.
 
 ## Permissions
 
