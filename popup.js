@@ -12,6 +12,17 @@ function setBusy(busy) {
   pdfBtn.disabled = busy;
 }
 
+function isClaudeDesignUrl(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    return url.protocol === 'https:' &&
+      url.hostname === 'claude.ai' &&
+      url.pathname.startsWith('/design/');
+  } catch {
+    return false;
+  }
+}
+
 // Status updates from service worker
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.action !== 'exportStatus') return;
@@ -34,7 +45,7 @@ async function runExport(format) {
 
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab.url?.includes('claude.ai')) {
+    if (!isClaudeDesignUrl(tab.url)) {
       setStatus('Open a Claude design first.', 'error');
       setBusy(false);
       return;
@@ -45,7 +56,7 @@ async function runExport(format) {
     // Hand off to the service worker — it attaches to THIS tab and clips to the
     // already-rendered iframe (no new tab opened).
     setStatus('Capturing…');
-    chrome.runtime.sendMessage({ action: 'export', format, scale, tabId: tab.id });
+    await chrome.runtime.sendMessage({ action: 'export', format, scale, tabId: tab.id });
 
   } catch (e) {
     setStatus(e.message || 'Error.', 'error');

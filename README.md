@@ -17,7 +17,7 @@ The extension icon appears in your toolbar.
 
 ## Usage
 
-1. Go to [claude.ai](https://claude.ai) and open a design (`claude.ai/design/…`)
+1. Go to [claude.ai](https://claude.ai) and open a design (`https://claude.ai/design/…`)
 2. Make sure the design has finished rendering and is visible on screen
 3. Click the extension icon
 4. Choose a scale — 1× (original size), 2× (double resolution), or 3× (print quality)
@@ -25,16 +25,26 @@ The extension icon appears in your toolbar.
 
 > **Heads-up:** during capture Chrome shows a yellow "… is debugging this browser" banner. That's expected — the extension uses the Chrome Debugger API to take the screenshot (see below) and removes itself the moment the capture finishes. Close DevTools on the tab before exporting, since only one debugger can attach at a time.
 
+The extension only runs on Claude Design pages at `https://claude.ai/design/...`.
+Exports target the designed asset/artboard itself, not Claude's surrounding
+preview pane, page background, or browser UI.
+
 ## How it works
 
 A Claude design renders inside a **sandboxed, cross-origin iframe** (`claudeusercontent.com`). The sandbox blocks DOM and script access from the page, so approaches like `html2canvas` or SVG serialization can't reach the content — they come back blank.
 
 Instead, the extension captures it the same way DevTools and Puppeteer do:
 
-1. **popup.js** validates the active tab is claude.ai, reads the chosen scale, and asks the service worker to export.
-2. **service-worker.js** attaches the Chrome Debugger to the current tab, locates the design iframe's rectangle, and calls `Page.captureScreenshot` clipped to that rect. The browser's compositor includes out-of-process iframes, so the rendered design is captured even though its DOM is unreachable. Resolution is driven by `clip.scale`; `captureBeyondViewport` handles content larger than the viewport. A blank-detection guard reports a clear error instead of silently saving an empty image.
-3. For **PDF**, the captured JPEG is embedded in a minimal hand-built PDF whose page size matches the design's CSS dimensions (1 CSS px = 1 pt).
-4. **offscreen.js** turns the resulting data URL into a blob URL (a service worker can't call `URL.createObjectURL`, and large `data:` URLs exceed Chrome's download size limit), which `chrome.downloads` then saves.
+1. **popup.js** validates the active tab is `https://claude.ai/design/...`, reads the chosen scale, and asks the service worker to export.
+2. **service-worker.js** validates the request again, verifies the tab URL, attaches the Chrome Debugger to the current tab, and locates the visible `claudeusercontent.com` design iframe. It never falls back to unrelated iframes.
+3. The worker tries to detect the artboard bounds inside the design frame and clips `Page.captureScreenshot` to those exact bounds. If direct bounds are unavailable, it captures the design iframe and applies conservative pixel trimming with padding and sanity checks.
+4. Resolution is driven by `clip.scale`; a max-pixel guard prevents oversized screenshots from consuming too much memory. A blank-detection guard reports a clear error instead of silently saving an empty image.
+5. For **PDF**, the bounded asset is JPEG-encoded and embedded in a minimal hand-built PDF whose page size matches the exported asset dimensions (1 CSS px = 1 pt).
+6. **offscreen.js** turns the resulting data URL into a blob URL (a service worker can't call `URL.createObjectURL`, and large `data:` URLs exceed Chrome's download size limit), which `chrome.downloads` then saves.
+
+If direct artboard bounds cannot be detected, the fallback trim is intentionally
+conservative. It may keep extra margin rather than risk cutting off real design
+edges, borders, shadows, corner marks, or background fills.
 
 ## Permissions
 
