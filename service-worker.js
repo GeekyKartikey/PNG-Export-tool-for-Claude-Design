@@ -207,7 +207,13 @@ async function downloadDataUrl(dataUrl, filename) {
   });
 }
 
+let exporting = false;
 async function runExport({ format, scale, tabId }) {
+  if (exporting) {
+    notify({ busy: true, message: 'An export is already running…' });
+    return;
+  }
+  exporting = true;
   clearBadge();
   try {
     const { dataUrl, cssW, cssH } = await captureDesignFromTab(tabId, format, scale);
@@ -229,6 +235,8 @@ async function runExport({ format, scale, tabId }) {
   } catch (e) {
     setBadge(false);
     notify({ busy: false, message: e.message || 'Export failed.', type: 'error' });
+  } finally {
+    exporting = false;
   }
 }
 
