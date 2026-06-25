@@ -1,10 +1,8 @@
-// Captures the Claude Design artifact by attaching the Chrome Debugger to the
-// already-open claude.ai tab and using Page.captureScreenshot. The browser-level
-// compositor includes cross-origin / out-of-process iframes (the design lives in
-// a sandboxed claudeusercontent.com iframe), so clipping to that iframe's rect
-// yields the rendered design — no new tab, no viewport override.
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+// Captures the Claude Design artifact by locating the sandboxed
+// claudeusercontent.com design URL, loading that raw document in a temporary
+// inactive tab, and screenshotting the clean document rather than the visible
+// Claude editor surface. Capturing the editor tab itself includes floating UI
+// overlays such as Tweaks panels, so it can never be a reliable asset export.
 
 const ALLOWED_FORMATS = new Set(['png', 'pdf']);
 const ALLOWED_SCALES = new Set([1, 2, 3]);
@@ -13,6 +11,7 @@ const MAX_CAPTURE_PIXELS = 32_000_000;
 const TRIM_PADDING_CSS_PX = 4;
 const MIN_TRIM_AREA_RATIO = 0.02;
 const MIN_TRIM_SIDE_RATIO = 0.08;
+const CAPTURE_TAB_LOAD_TIMEOUT_MS = 15000;
 
 function isClaudeDesignUrl(rawUrl) {
   try {
@@ -35,7 +34,9 @@ function isClaudeusercontentUrl(rawUrl) {
   }
 }
 
-function validateExportMessage(msg) {
+let statusTabId = null;
+
+function validateExportMessage(msg, sender) {
   if (!msg || msg.action !== 'export') {
     return { ok: false, error: 'Invalid export request.' };
   }
@@ -45,12 +46,13 @@ function validateExportMessage(msg) {
   if (!ALLOWED_SCALES.has(msg.scale)) {
     return { ok: false, error: 'Invalid export scale.' };
   }
-  if (typeof msg.tabId !== 'number' || !Number.isFinite(msg.tabId)) {
+  const tabId = typeof msg.tabId === 'number' ? msg.tabId : sender?.tab?.id;
+  if (typeof tabId !== 'number' || !Number.isFinite(tabId)) {
     return { ok: false, error: 'Invalid export tab.' };
   }
   return {
     ok: true,
-    request: { format: msg.format, scale: msg.scale, tabId: msg.tabId },
+    request: { format: msg.format, scale: msg.scale, tabId },
   };
 }
 
@@ -65,6 +67,9 @@ async function assertClaudeDesignTab(tabId) {
 // can show the final result, and a badge so success/failure is visible regardless.
 function notify(status) {
   chrome.runtime.sendMessage({ action: 'exportStatus', ...status }).catch(() => {});
+  if (statusTabId != null) {
+    chrome.tabs.sendMessage(statusTabId, { action: 'exportStatus', ...status }).catch(() => {});
+  }
   chrome.storage.session.set({ lastStatus: status }).catch(() => {});
 }
 function setBadge(ok) {
@@ -113,143 +118,152 @@ async function getIframeRect(tabId) {
   return JSON.parse(result.value);
 }
 
-function flattenFrameTree(node, out = []) {
-  if (!node) return out;
-  if (node.frame) out.push(node.frame);
-  for (const child of node.childFrames || []) flattenFrameTree(child, out);
-  return out;
-}
-
-async function getClaudeFrameId(tabId, iframeSrc) {
-  try {
-    const { frameTree } = await chrome.debugger.sendCommand({ tabId }, 'Page.getFrameTree');
-    const frames = flattenFrameTree(frameTree);
-    const exact = frames.find(frame => frame.url === iframeSrc);
-    if (exact) return exact.id;
-    return frames.find(frame => isClaudeusercontentUrl(frame.url))?.id || null;
-  } catch {
-    return null;
-  }
-}
-
-function isUsableArtboardRect(rect, iframeRect) {
-  if (!rect || rect.width < 100 || rect.height < 100) return false;
-  if (rect.x < -1 || rect.y < -1) return false;
-  if (rect.x + rect.width > iframeRect.width + 1) return false;
-  if (rect.y + rect.height > iframeRect.height + 1) return false;
-  const fillsIframe = Math.abs(rect.x) < 2 && Math.abs(rect.y) < 2 &&
-    Math.abs(rect.width - iframeRect.width) < 2 &&
-    Math.abs(rect.height - iframeRect.height) < 2;
-  if (fillsIframe) return false;
-  const areaRatio = (rect.width * rect.height) / (iframeRect.width * iframeRect.height);
-  return areaRatio >= MIN_TRIM_AREA_RATIO;
-}
-
-async function getArtboardRect(tabId, frameId, iframeRect) {
-  if (!frameId) return null;
-  try {
-    const { executionContextId } = await chrome.debugger.sendCommand({ tabId }, 'Page.createIsolatedWorld', {
-      frameId,
-      worldName: 'claude-design-export',
-      grantUniveralAccess: true,
-    });
-    const { result, exceptionDetails } = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
-      contextId: executionContextId,
-      returnByValue: true,
-      expression: `JSON.stringify((function(){
-        const MIN_SIDE = 100;
-        const selectors = [
-          '[data-testid*="artboard" i]',
-          '[data-testid*="canvas" i]',
-          '[data-testid*="design" i]',
-          '[aria-label*="artboard" i]',
-          '[aria-label*="design" i]',
-          '[class*="artboard" i]',
-          '[class*="canvas" i]',
-          '[class*="design" i]',
-          'svg',
-          'canvas'
-        ];
-
-        function rectFor(el, weight) {
-          const style = getComputedStyle(el);
-          if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return null;
-          const r = el.getBoundingClientRect();
-          if (r.width < MIN_SIDE || r.height < MIN_SIDE) return null;
-          const area = r.width * r.height;
-          const viewportMatch = Math.abs(r.left) < 2 && Math.abs(r.top) < 2 &&
-            Math.abs(r.width - innerWidth) < 2 && Math.abs(r.height - innerHeight) < 2;
-          return {
-            x: Math.floor(r.left),
-            y: Math.floor(r.top),
-            width: Math.ceil(r.width),
-            height: Math.ceil(r.height),
-            score: weight * 1e12 + area - (viewportMatch ? 1e10 : 0)
-          };
-        }
-
-        const candidates = [];
-        for (const selector of selectors) {
-          let nodes = [];
-          try { nodes = Array.from(document.querySelectorAll(selector)); } catch (_) {}
-          const weight = /artboard|canvas|design/.test(selector) ? 3 : 2;
-          for (const node of nodes) {
-            const r = rectFor(node, weight);
-            if (r) candidates.push(r);
-          }
-        }
-
-        const bodyKids = Array.from(document.body ? document.body.children : []);
-        const visibleKids = bodyKids.map(el => rectFor(el, 1)).filter(Boolean);
-        if (visibleKids.length === 1) candidates.push({ ...visibleKids[0], score: visibleKids[0].score + 5e11 });
-        if (visibleKids.length > 1 && visibleKids.length <= 30) {
-          const minX = Math.min(...visibleKids.map(r => r.x));
-          const minY = Math.min(...visibleKids.map(r => r.y));
-          const maxX = Math.max(...visibleKids.map(r => r.x + r.width));
-          const maxY = Math.max(...visibleKids.map(r => r.y + r.height));
-          const width = Math.ceil(maxX - minX);
-          const height = Math.ceil(maxY - minY);
-          if (width >= MIN_SIDE && height >= MIN_SIDE) {
-            const viewportMatch = Math.abs(minX) < 2 && Math.abs(minY) < 2 &&
-              Math.abs(width - innerWidth) < 2 && Math.abs(height - innerHeight) < 2;
-            candidates.push({
-              x: Math.floor(minX),
-              y: Math.floor(minY),
-              width,
-              height,
-              score: 1.5e12 + width * height - (viewportMatch ? 1e10 : 0)
-            });
-          }
-        }
-
-        candidates.sort((a, b) => b.score - a.score);
-        if (!candidates.length) return null;
-        const best = candidates[0];
-        return { x: best.x, y: best.y, width: best.width, height: best.height };
-      })())`,
-    });
-    if (exceptionDetails || result?.value == null) return null;
-    const rect = JSON.parse(result.value);
-    return isUsableArtboardRect(rect, iframeRect) ? rect : null;
-  } catch {
-    return null;
-  }
-}
-
-function artboardClip(iframeRect, artboardRect) {
-  if (!artboardRect) return null;
-  return {
-    x: iframeRect.x + artboardRect.x,
-    y: iframeRect.y + artboardRect.y,
-    width: artboardRect.width,
-    height: artboardRect.height,
-  };
-}
-
 function assertCaptureSize(rect, scale) {
   const pixels = rect.width * rect.height * scale * scale;
   if (pixels > MAX_CAPTURE_PIXELS) {
     throw new Error('Export is too large. Try a lower scale or make the design smaller.');
+  }
+}
+
+async function getDesignUrlFromClaudeTab(tabId) {
+  await chrome.debugger.attach({ tabId }, '1.3').catch((e) => {
+    throw new Error('Could not inspect the Claude tab (close DevTools if open): ' + (e.message || e));
+  });
+  try {
+    notify({ busy: true, message: 'Finding design document…' });
+    const rect = await getIframeRect(tabId);
+    if (!rect?.src || !isClaudeusercontentUrl(rect.src)) {
+      throw new Error('No design preview found. Open the design and let it finish rendering.');
+    }
+    return rect.src;
+  } finally {
+    await chrome.debugger.detach({ tabId }).catch(() => {});
+  }
+}
+
+function waitForTabComplete(tabId) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      reject(new Error('Timed out loading the design document.'));
+    }, CAPTURE_TAB_LOAD_TIMEOUT_MS);
+
+    function finish() {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      resolve();
+    }
+
+    function onUpdated(updatedTabId, info) {
+      if (updatedTabId === tabId && info.status === 'complete') finish();
+    }
+
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    chrome.tabs.get(tabId).then((tab) => {
+      if (tab.status === 'complete') finish();
+    }).catch((e) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      reject(e);
+    });
+  });
+}
+
+async function prepareRawDesignDocument(tabId) {
+  // Print media is the closest match to Claude's own PDF/print export path and
+  // usually hides editor-only controls. The extra DOM pass handles tweak panels
+  // that remain mounted outside print styles.
+  await chrome.debugger.sendCommand({ tabId }, 'Emulation.setEmulatedMedia', { media: 'print' }).catch(() => {});
+  await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
+    awaitPromise: true,
+    returnByValue: true,
+    expression: `(async function(){
+      const style = document.createElement('style');
+      style.textContent = '@media screen, print { [data-testid*="tweak" i], [aria-label*="tweak" i] { display: none !important; } }';
+      document.documentElement.appendChild(style);
+
+      for (const el of Array.from(document.querySelectorAll('*'))) {
+        const text = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+        if (!text || !/\\bTweaks\\b/i.test(text)) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0 && r.width <= 800 && r.height <= 600) {
+          el.style.setProperty('display', 'none', 'important');
+        }
+      }
+
+      if (document.fonts && document.fonts.ready) {
+        await document.fonts.ready.catch(() => {});
+      }
+      await Promise.all(Array.from(document.images)
+        .filter(img => !img.complete)
+        .map(img => new Promise(resolve => {
+          img.addEventListener('load', resolve, { once: true });
+          img.addEventListener('error', resolve, { once: true });
+        })));
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      return true;
+    })()`,
+  });
+}
+
+async function getRawDocumentClip(tabId) {
+  const metrics = await chrome.debugger.sendCommand({ tabId }, 'Page.getLayoutMetrics');
+  const content = metrics.cssContentSize || metrics.contentSize;
+  const clip = {
+    x: Math.max(0, Math.floor(content?.x || 0)),
+    y: Math.max(0, Math.floor(content?.y || 0)),
+    width: Math.ceil(content?.width || 0),
+    height: Math.ceil(content?.height || 0),
+  };
+  if (clip.width < 100 || clip.height < 100) {
+    throw new Error('Could not determine the design document size.');
+  }
+  return clip;
+}
+
+async function captureRawDesignUrl(designUrl, scale) {
+  if (!isClaudeusercontentUrl(designUrl)) {
+    throw new Error('Invalid design document URL.');
+  }
+
+  notify({ busy: true, message: 'Opening clean design document…' });
+  const tab = await chrome.tabs.create({ url: designUrl, active: false });
+  let attached = false;
+  try {
+    await waitForTabComplete(tab.id);
+    await chrome.debugger.attach({ tabId: tab.id }, '1.3').catch((e) => {
+      throw new Error('Could not capture the design document: ' + (e.message || e));
+    });
+    attached = true;
+
+    await prepareRawDesignDocument(tab.id);
+    const clip = await getRawDocumentClip(tab.id);
+    assertCaptureSize(clip, scale);
+
+    notify({ busy: true, message: 'Capturing clean asset…' });
+    const { data } = await chrome.debugger.sendCommand({ tabId: tab.id }, 'Page.captureScreenshot', {
+      format: 'png',
+      captureBeyondViewport: true,
+      fromSurface: true,
+      clip: { ...clip, scale },
+    });
+    const dataUrl = `data:image/png;base64,${data}`;
+
+    if (await isMostlyBlank(dataUrl)) {
+      throw new Error('Capture came back blank. Make sure the design is fully loaded, then retry.');
+    }
+
+    return { dataUrl, usedDirectBounds: true };
+  } finally {
+    if (attached) await chrome.debugger.detach({ tabId: tab.id }).catch(() => {});
+    await chrome.tabs.remove(tab.id).catch(() => {});
   }
 }
 
@@ -278,43 +292,8 @@ async function isMostlyBlank(dataUrl) {
 }
 
 async function captureDesignFromTab(tabId, scale) {
-  await chrome.debugger.attach({ tabId }, '1.3').catch((e) => {
-    throw new Error('Could not attach to the tab (close DevTools if open): ' + (e.message || e));
-  });
-  try {
-    notify({ busy: true, message: 'Finding design area…' });
-    const rect = await getIframeRect(tabId);
-    if (!rect || rect.width < 1 || rect.height < 1) {
-      throw new Error('No design preview found. Open the design and let it finish rendering.');
-    }
-    const frameId = await getClaudeFrameId(tabId, rect.src);
-    const artboardRect = await getArtboardRect(tabId, frameId, rect);
-    const clip = artboardClip(rect, artboardRect) || rect;
-    assertCaptureSize(clip, scale);
-
-    await sleep(150); // let any in-progress paint settle
-
-    notify({ busy: true, message: 'Capturing design…' });
-    // Always capture lossless PNG: it's the source for both the PNG export and
-    // (after trimming) the PDF's JPEG, so we never compound JPEG artifacts.
-    // Resolution comes from clip.scale (NOT deviceScaleFactor), so the returned
-    // image's TRUE pixel size is width*scale x height*scale.
-    const { data } = await chrome.debugger.sendCommand({ tabId }, 'Page.captureScreenshot', {
-      format: 'png',
-      captureBeyondViewport: true,
-      fromSurface: true,
-      clip: { x: clip.x, y: clip.y, width: clip.width, height: clip.height, scale },
-    });
-    const dataUrl = `data:image/png;base64,${data}`;
-
-    if (await isMostlyBlank(dataUrl)) {
-      throw new Error('Capture came back blank. Make sure the design is fully visible, then retry.');
-    }
-
-    return { dataUrl, usedDirectBounds: !!artboardRect };
-  } finally {
-    await chrome.debugger.detach({ tabId }).catch(() => {});
-  }
+  const designUrl = await getDesignUrlFromClaudeTab(tabId);
+  return captureRawDesignUrl(designUrl, scale);
 }
 
 // ---- Auto-trim ----
@@ -496,6 +475,7 @@ async function runExport({ format, scale, tabId }) {
     return;
   }
   exporting = true;
+  statusTabId = tabId;
   clearBadge();
   try {
     await assertClaudeDesignTab(tabId);
@@ -532,16 +512,25 @@ async function runExport({ format, scale, tabId }) {
     notify({ busy: false, message: e.message || 'Export failed.', type: 'error' });
   } finally {
     exporting = false;
+    setTimeout(() => {
+      if (statusTabId === tabId) statusTabId = null;
+    }, 1000);
   }
 }
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.action !== 'export') return false;
 
-  const validation = validateExportMessage(msg);
+  const validation = validateExportMessage(msg, sender);
   if (!validation.ok) {
     notify({ busy: false, message: validation.error, type: 'error' });
     sendResponse({ started: false, error: validation.error });
+    return false;
+  }
+  if (exporting) {
+    const error = 'An export is already running.';
+    notify({ busy: true, message: error });
+    sendResponse({ started: false, error });
     return false;
   }
 
