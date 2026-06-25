@@ -14,8 +14,27 @@ const MIN_TRIM_SIDE_RATIO = 0.08;
 const CAPTURE_TAB_LOAD_TIMEOUT_MS = 15000;
 const RAW_CAPTURE_RETRY_COUNT = 6;
 const RAW_CAPTURE_RETRY_DELAY_MS = 500;
+const DEBUGGER_COMMAND_TIMEOUT_MS = 10000;
+const SCREENSHOT_TIMEOUT_MS = 15000;
+const RAW_DOCUMENT_READY_TIMEOUT_MS = 5000;
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+function withTimeout(promise, ms, label) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out.`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+function debuggerCommand(tabId, method, params = {}, timeoutMs = DEBUGGER_COMMAND_TIMEOUT_MS) {
+  return withTimeout(
+    chrome.debugger.sendCommand({ tabId }, method, params),
+    timeoutMs,
+    method
+  );
+}
 
 function isClaudeDesignUrl(rawUrl) {
   try {
@@ -87,7 +106,7 @@ function clearBadge() {
 // Find the design iframe's rect in CSS px (page coordinates). Only
 // claudeusercontent.com frames are eligible; unrelated iframes must fail closed.
 async function getIframeRect(tabId) {
-  const { result, exceptionDetails } = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
+  const { result, exceptionDetails } = await debuggerCommand(tabId, 'Runtime.evaluate', {
     expression: `JSON.stringify((function(){
       const isClaudeusercontent = (src) => {
         try {
@@ -183,8 +202,8 @@ function waitForTabComplete(tabId) {
 async function prepareRawDesignDocument(tabId) {
   // Keep normal screen media for raw .dc.html documents. Print emulation can
   // blank Claude's generated app; targeted DOM/CSS cleanup handles tweak UI.
-  await chrome.debugger.sendCommand({ tabId }, 'Emulation.setEmulatedMedia', { media: 'screen' }).catch(() => {});
-  await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
+  await debuggerCommand(tabId, 'Emulation.setEmulatedMedia', { media: 'screen' }).catch(() => {});
+  await debuggerCommand(tabId, 'Runtime.evaluate', {
     awaitPromise: true,
     returnByValue: true,
     expression: `(async function(){
@@ -202,22 +221,28 @@ async function prepareRawDesignDocument(tabId) {
       }
 
       if (document.fonts && document.fonts.ready) {
-        await document.fonts.ready.catch(() => {});
+        await Promise.race([
+          document.fonts.ready.catch(() => {}),
+          new Promise(resolve => setTimeout(resolve, ${RAW_DOCUMENT_READY_TIMEOUT_MS}))
+        ]);
       }
-      await Promise.all(Array.from(document.images)
+      await Promise.race([
+        Promise.all(Array.from(document.images)
         .filter(img => !img.complete)
         .map(img => new Promise(resolve => {
           img.addEventListener('load', resolve, { once: true });
           img.addEventListener('error', resolve, { once: true });
-        })));
+        }))),
+        new Promise(resolve => setTimeout(resolve, ${RAW_DOCUMENT_READY_TIMEOUT_MS}))
+      ]);
       await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
       return true;
     })()`,
-  });
+  }, DEBUGGER_COMMAND_TIMEOUT_MS + RAW_DOCUMENT_READY_TIMEOUT_MS);
 }
 
 async function getRawDocumentClip(tabId) {
-  const metrics = await chrome.debugger.sendCommand({ tabId }, 'Page.getLayoutMetrics');
+  const metrics = await debuggerCommand(tabId, 'Page.getLayoutMetrics');
   const content = metrics.cssContentSize || metrics.contentSize;
   const clip = {
     x: Math.max(0, Math.floor(content?.x || 0)),
@@ -232,12 +257,12 @@ async function getRawDocumentClip(tabId) {
 }
 
 async function captureScreenshotDataUrl(tabId, clip, scale) {
-  const { data } = await chrome.debugger.sendCommand({ tabId }, 'Page.captureScreenshot', {
+  const { data } = await debuggerCommand(tabId, 'Page.captureScreenshot', {
     format: 'png',
     captureBeyondViewport: true,
     fromSurface: true,
     clip: { ...clip, scale },
-  });
+  }, SCREENSHOT_TIMEOUT_MS);
   return `data:image/png;base64,${data}`;
 }
 
@@ -248,7 +273,7 @@ async function captureNonBlankRawDocument(tabId, scale) {
       notify({ busy: true, message: 'Waiting for design to paint…' });
       await sleep(RAW_CAPTURE_RETRY_DELAY_MS);
       if (attempt === 2) {
-        await chrome.debugger.sendCommand({ tabId }, 'Page.bringToFront').catch(() => {});
+        await debuggerCommand(tabId, 'Page.bringToFront').catch(() => {});
       }
     }
 
@@ -275,7 +300,11 @@ async function captureRawDesignUrl(designUrl, scale) {
   }
 
   notify({ busy: true, message: 'Opening clean design document…' });
-  const tab = await chrome.tabs.create({ url: designUrl, active: false });
+  const createProps = { url: designUrl, active: true };
+  if (statusTabId != null) createProps.openerTabId = statusTabId;
+  // Chrome may not paint background tabs quickly enough for CDP screenshots.
+  // Open the raw document active, capture it, then close it and restore focus.
+  const tab = await chrome.tabs.create(createProps);
   let attached = false;
   try {
     await waitForTabComplete(tab.id);
@@ -291,6 +320,7 @@ async function captureRawDesignUrl(designUrl, scale) {
   } finally {
     if (attached) await chrome.debugger.detach({ tabId: tab.id }).catch(() => {});
     await chrome.tabs.remove(tab.id).catch(() => {});
+    if (statusTabId != null) await chrome.tabs.update(statusTabId, { active: true }).catch(() => {});
   }
 }
 
